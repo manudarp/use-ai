@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+
+.ai/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
