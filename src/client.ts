@@ -1,4 +1,5 @@
 import path from "node:path";
+import fs from "node:fs";
 
 import {
   OpenAICompatibleProvider
@@ -152,6 +153,13 @@ export class AI {
           ".ai",
           "ai.sqlite"
         );
+
+      const resolvedDbPath = path.resolve(
+        config.dbPath ??
+        path.join(process.cwd(), ".ai", "ai.sqlite")
+      );
+
+      fs.mkdirSync(path.dirname(resolvedDbPath), { recursive: true });
 
       this.knowledgeBase =
         new KnowledgeBase({
