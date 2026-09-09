@@ -27,13 +27,13 @@ import type {
 } from "./types.js";
 
 const DEFAULT_BASE_URL =
-  "https://api.together.ai/v1";
+  "https://openrouter.ai/api/v1";
 
 const DEFAULT_MODEL =
-  "Qwen/Qwen3.5-9B";
+  "openrouter/free";
 
 const DEFAULT_EMBEDDING_MODEL =
-  "intfloat/multilingual-e5-large-instruct";
+  "liquid/lfm-2.5-embedding-350m:free";
 
 const DEFAULT_CHUNK_SIZE =
   1200;

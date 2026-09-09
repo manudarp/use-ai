@@ -1,10 +1,6 @@
 import Database from "better-sqlite3";
 
 import {
-  getExtensionPath
-} from "@sqliteai/sqlite-vector";
-
-import {
   KnowledgeBaseError
 } from "../errors.js";
 
@@ -20,6 +16,11 @@ export interface SQLiteVectorStoreOptions {
     | "full"
     | "quantized";
 
+  /**
+   * Quantizzazione accettata solo per retrocompatibilità.
+   * Ignorata dal backend JavaScript: la quantizzazione
+   * nativa di sqlite-vector non è più disponibile.
+   */
   quantization?: {
     qtype?:
       | "UINT8"
@@ -31,6 +32,17 @@ export interface SQLiteVectorStoreOptions {
 
     maxMemory?: string;
   };
+
+  /**
+   * Attiva la cache dei vettori in memoria.
+   * Consigliata solo per knowledge base con decine di migliaia
+   * di chunk: la cache vive nel heap del processo, con 4 byte
+   * per dimensione per chunk (≈ 600 MB per 100k chunk a 1536d,
+   * soglia critica su architetture ia32, ~1,7/2 GB totali).
+   * Default: false.
+   */
+  useVectorCache?:
+    boolean;
 }
 
 export interface VectorSearchResult {
@@ -49,9 +61,6 @@ export interface VectorSearchResult {
 const TABLE_NAME =
   "documents";
 
-const VECTOR_COLUMN =
-  "embedding";
-
 const DIMENSION_KEY =
   "embedding_dimension";
 
@@ -60,33 +69,37 @@ export class SQLiteVectorStore {
   private readonly db:
     Database.Database;
 
-  private readonly searchMode:
-    "full" | "quantized";
-
-  private readonly quantization:
-    SQLiteVectorStoreOptions["quantization"];
+  private readonly useVectorCache:
+    boolean = false;
 
   private dimension:
     number | null = null;
 
-  private vectorInitialized =
-    false;
+  private vectorsCache:
+    Float32Array[] | null = null;
+
+  private vectorsIds:
+    number[] | null = null;
 
   constructor(
     options: SQLiteVectorStoreOptions
   ) {
 
-    this.searchMode =
-      options.searchMode ??
-      "full";
-
-    this.quantization =
-      options.quantization;
-
     this.db =
       new Database(
         options.dbPath
       );
+
+    if (
+      options.searchMode ===
+        "quantized" ||
+      options.quantization
+    ) {
+
+      console.warn(
+        "[use-ai] Quantized search is not supported by the JavaScript vector backend; falling back to full scan."
+      );
+    }
 
     this.db.pragma(
       "journal_mode = WAL"
@@ -96,31 +109,9 @@ export class SQLiteVectorStore {
       "foreign_keys = ON"
     );
 
-    this.loadExtension();
-
     this.createSchema();
 
     this.restoreVectorConfiguration();
-  }
-
-  private loadExtension(): void {
-
-    try {
-
-      this.db.loadExtension(
-        getExtensionPath()
-      );
-
-    } catch (error) {
-
-      throw new KnowledgeBaseError(
-        `Unable to load sqlite-vector: ${
-          error instanceof Error
-            ? error.message
-            : String(error)
-        }`
-      );
-    }
   }
 
   private createSchema(): void {
@@ -169,8 +160,6 @@ export class SQLiteVectorStore {
 
     this.dimension =
       Number(dimension);
-
-    this.initializeVector();
   }
 
   private getMetadata(
@@ -214,46 +203,6 @@ export class SQLiteVectorStore {
       );
   }
 
-  private initializeVector(): void {
-
-    if (
-      this.vectorInitialized ||
-      this.dimension === null
-    ) {
-      return;
-    }
-
-    try {
-
-      this.db
-        .prepare(`
-          SELECT vector_init(
-            ?,
-            ?,
-            ?
-          )
-        `)
-        .get(
-          TABLE_NAME,
-          VECTOR_COLUMN,
-          `dimension=${this.dimension},type=FLOAT32,distance=COSINE`
-        );
-
-      this.vectorInitialized =
-        true;
-
-    } catch (error) {
-
-      throw new KnowledgeBaseError(
-        `Unable to initialize sqlite-vector: ${
-          error instanceof Error
-            ? error.message
-            : String(error)
-        }`
-      );
-    }
-  }
-
   private ensureDimension(
     vector: number[]
   ): void {
@@ -280,8 +229,6 @@ export class SQLiteVectorStore {
           this.dimension
         )
       );
-
-      this.initializeVector();
 
       return;
     }
@@ -343,7 +290,7 @@ export class SQLiteVectorStore {
           @source,
           @chunkIndex,
           @text,
-          vector_as_f32(@embedding)
+          @embedding
         )
 
         ON CONFLICT (
@@ -392,6 +339,8 @@ export class SQLiteVectorStore {
     transaction(
       documents
     );
+
+    this.invalidateCache();
   }
 
   removeSource(
@@ -404,6 +353,8 @@ export class SQLiteVectorStore {
         WHERE source = ?
       `)
       .run(source);
+
+    this.invalidateCache();
   }
 
   clear(): void {
@@ -411,6 +362,8 @@ export class SQLiteVectorStore {
     this.db.exec(`
       DELETE FROM documents;
     `);
+
+    this.invalidateCache();
   }
 
   search(
@@ -419,7 +372,8 @@ export class SQLiteVectorStore {
   ): VectorSearchResult[] {
 
     if (
-      !this.vectorInitialized
+      this.dimension === null ||
+      this.count === 0
     ) {
       return [];
     }
@@ -434,229 +388,218 @@ export class SQLiteVectorStore {
       );
     }
 
-    const query =
+    return this.searchFull(
       this.toFloat32Buffer(
         vector
-      );
-
-    if (
-      this.searchMode ===
-      "quantized"
-    ) {
-
-      this.ensureQuantization();
-
-      return this.searchQuantized(
-        query,
-        topK
-      );
-    }
-
-    return this.searchFull(
-      query,
+      ),
       topK
     );
   }
 
   private searchFull(
-    vector: Buffer,
+    query: Buffer,
     topK: number
   ): VectorSearchResult[] {
 
-    const rows =
-      this.db
-        .prepare(`
-          SELECT
-
-            d.id,
-
-            d.text,
-
-            d.source,
-
-            d.chunk_index,
-
-            v.distance
-
-          FROM vector_full_scan(
-            'documents',
-            'embedding',
-            ?,
-            ?
-          ) AS v
-
-          JOIN documents AS d
-            ON d.rowid = v.rowid
-        `)
-        .all(
-          vector,
-          topK
-        ) as Array<{
-          id: number;
-          text: string;
-          source: string;
-          chunk_index: number;
-          distance: number;
-        }>;
-
-    return rows.map(
-      row => ({
-
-        id:
-          row.id,
-
-        text:
-          row.text,
-
-        source:
-          row.source,
-
-        chunkIndex:
-          row.chunk_index,
-
-        distance:
-          row.distance
-      })
-    );
-  }
-
-  private searchQuantized(
-    vector: Buffer,
-    topK: number
-  ): VectorSearchResult[] {
-
-    const rows =
-      this.db
-        .prepare(`
-          SELECT
-
-            d.id,
-
-            d.text,
-
-            d.source,
-
-            d.chunk_index,
-
-            v.distance
-
-          FROM vector_quantize_scan(
-            'documents',
-            'embedding',
-            ?,
-            ?
-          ) AS v
-
-          JOIN documents AS d
-            ON d.rowid = v.rowid
-        `)
-        .all(
-          vector,
-          topK
-        ) as Array<{
-          id: number;
-          text: string;
-          source: string;
-          chunk_index: number;
-          distance: number;
-        }>;
-
-    return rows.map(
-      row => ({
-
-        id:
-          row.id,
-
-        text:
-          row.text,
-
-        source:
-          row.source,
-
-        chunkIndex:
-          row.chunk_index,
-
-        distance:
-          row.distance
-      })
-    );
-  }
-
-  private ensureQuantization(): void {
-
-    try {
-
-      const options =
-        this.quantization;
-
-      const parts: string[] = [];
-
-      if (
-        options?.qtype
-      ) {
-
-        parts.push(
-          `qtype=${options.qtype}`
-        );
-      }
-
-      if (
-        options?.qbits
-      ) {
-
-        parts.push(
-          `qbits=${options.qbits}`
-        );
-      }
-
-      if (
-        options?.maxMemory
-      ) {
-
-        parts.push(
-          `max_memory=${options.maxMemory}`
-        );
-      }
-
-      const optionString =
-        parts.join(",");
-
-      this.db
-        .prepare(`
-          SELECT vector_quantize(
-            ?,
-            ?,
-            ?
-          )
-        `)
-        .get(
-          TABLE_NAME,
-          VECTOR_COLUMN,
-          optionString
-        );
-
-      this.db
-        .prepare(`
-          SELECT vector_quantize_preload(
-            ?,
-            ?
-          )
-        `)
-        .get(
-          TABLE_NAME,
-          VECTOR_COLUMN
-        );
-
-    } catch (error) {
-
-      throw new KnowledgeBaseError(
-        `Unable to prepare vector quantization: ${
-          error instanceof Error
-            ? error.message
-            : String(error)
-        }`
+    const queryVector =
+      new Float32Array(
+        query.buffer,
+        query.byteOffset,
+        query.length / 4
       );
+
+    let scored:
+      Array<{
+        id: number;
+        distance: number;
+      }>;
+
+    if (
+      this.useVectorCache
+    ) {
+
+      if (
+        this.vectorsCache === null
+      ) {
+        this.loadVectors();
+      }
+
+      scored =
+        this.vectorsCache!
+          .map(
+            (vector, index) => ({
+
+              id:
+                this.vectorsIds![
+                  index
+                ],
+
+              distance:
+                cosineDistanceVectors(
+                  queryVector,
+                  vector
+                )
+            })
+          );
+
+    } else {
+
+      const rows =
+        this.db
+          .prepare(`
+            SELECT
+
+              id,
+
+              text,
+
+              source,
+
+              chunk_index,
+
+              embedding
+
+            FROM documents
+          `)
+          .all() as Array<{
+            id: number;
+            text: string;
+            source: string;
+            chunk_index: number;
+            embedding: Buffer;
+          }>;
+
+      scored =
+        rows.map(
+          row => ({
+
+            id:
+              row.id,
+
+            distance:
+              cosineDistance(
+                query,
+                row.embedding
+              )
+          })
+        );
     }
+
+    scored.sort(
+      (a, b) =>
+        a.distance -
+        b.distance
+    );
+
+    const top =
+      scored.slice(
+        0,
+        topK
+      );
+
+    /*
+     * Il testo lo recuperiamo SOLO per i vincitori:
+     * con la cache attiva non è mai stato caricato in memoria.
+     */
+
+    return top.map(
+      item => {
+
+        const row =
+          this.db
+            .prepare(`
+              SELECT
+
+                text,
+
+                source,
+
+                chunk_index
+
+              FROM documents
+              WHERE id = ?
+            `)
+            .get(
+              item.id
+            ) as {
+              text: string;
+              source: string;
+              chunk_index: number;
+            };
+
+        return {
+
+          id:
+            item.id,
+
+          text:
+            row.text,
+
+          source:
+            row.source,
+
+          chunkIndex:
+            row.chunk_index,
+
+          distance:
+            item.distance
+        };
+      }
+    );
+  }
+
+  /*
+   * Carica una volta sola tutti i vettori in memoria.
+   * Da chiamare al primo utilizzo della cache e ogni
+   * volta che questa viene invalidata.
+   */
+  private loadVectors(): void {
+
+    const rows =
+      this.db
+        .prepare(`
+          SELECT
+
+            id,
+
+            embedding
+
+          FROM documents
+        `)
+        .all() as Array<{
+          id: number;
+          embedding: Buffer;
+        }>;
+
+    this.vectorsIds =
+      rows.map(
+        row =>
+          row.id
+      );
+
+    this.vectorsCache =
+      rows.map(
+        row =>
+          new Float32Array(
+            row.embedding.buffer,
+            row.embedding.byteOffset,
+            row.embedding.length / 4
+          )
+      );
+  }
+
+  /*
+   * Svuota la cache: la successiva search() ricaricherà
+   * i vettori dal database. Chiamata dopo ogni modifica
+   * ai dati (add, removeSource, clear).
+   */
+  private invalidateCache(): void {
+
+    this.vectorsCache =
+      null;
+
+    this.vectorsIds =
+      null;
   }
 
   get count(): number {
@@ -679,49 +622,90 @@ export class SQLiteVectorStore {
   }
 
   get vectorBackend(): string | null {
-
-    try {
-
-      const row =
-        this.db
-          .prepare(`
-            SELECT vector_backend() AS backend
-          `)
-          .get() as {
-            backend: string;
-          };
-
-      return row.backend;
-
-    } catch {
-
-      return null;
-    }
+    return "javascript-full-scan";
   }
 
   get vectorVersion(): string | null {
-
-    try {
-
-      const row =
-        this.db
-          .prepare(`
-            SELECT vector_version() AS version
-          `)
-          .get() as {
-            version: string;
-          };
-
-      return row.version;
-
-    } catch {
-
-      return null;
-    }
+    return null;
   }
 
   close(): void {
 
     this.db.close();
   }
+}
+
+function cosineDistance(
+  a: Buffer,
+  b: Buffer
+): number {
+
+  const left =
+    new Float32Array(
+      a.buffer,
+      a.byteOffset,
+      a.length / 4
+    );
+
+  const right =
+    new Float32Array(
+      b.buffer,
+      b.byteOffset,
+      b.length / 4
+    );
+
+  return cosineDistanceVectors(
+    left,
+    right
+  );
+}
+
+function cosineDistanceVectors(
+  left: Float32Array,
+  right: Float32Array
+): number {
+
+  if (
+    left.length !==
+    right.length
+  ) {
+
+    throw new KnowledgeBaseError(
+      `Cosine distance dimension mismatch: ${left.length} vs ${right.length}.`
+    );
+  }
+
+  let dot = 0;
+  let normLeft = 0;
+  let normRight = 0;
+
+  for (
+    let i = 0;
+    i < left.length;
+    i++
+  ) {
+
+    dot +=
+      left[i] *
+      right[i];
+
+    normLeft +=
+      left[i] *
+      left[i];
+
+    normRight +=
+      right[i] *
+      right[i];
+  }
+
+  if (
+    normLeft === 0 ||
+    normRight === 0
+  ) {
+    return 1;
+  }
+
+  return 1 -
+    dot /
+    (Math.sqrt(normLeft) * Math.sqrt(normRight));
 }
